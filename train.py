@@ -273,7 +273,7 @@ def main():
     )
 
     # ModelConfig의 모든 필드를 **kwargs로 전달
-    model = TinySeq2Seq(
+    model = TinyCNNSeq2Seq(
         in_vocab=input_tokenizer.vocab_size,
         out_vocab=output_tokenizer.vocab_size,
         **model_config.__dict__,  # 모델 설정을 **kwargs로 전달
