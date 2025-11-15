@@ -56,9 +56,92 @@ def train_loop(
     # best EM 추적용 변수 (None이 아니면 개선 시 모델 저장)
     best_em = float("-inf")
 
+    latest_train_loss: float | None = None
+
+    def run_validation(epoch_idx: int):
+        """Run validation loop, returning avg loss and metrics."""
+        nonlocal best_em
+        if val_dataloader is None:
+            return None, {}
+        model.eval()
+        with torch.no_grad():
+            preds_all: List[str] = []
+            targets_all: List[str] = []
+            inputs_all: List[str] = []
+            val_loss_total = 0.0
+            val_batches = 0
+
+            for val_batch in val_dataloader:
+                val_bt = tokenize_batch(
+                    val_batch,
+                    input_tokenizer,
+                    output_tokenizer,
+                    max_input_length=tokenizer_config.max_input_length,
+                    max_output_length=tokenizer_config.max_output_length,
+                )
+                val_src = val_bt.src.to(device)
+                val_mask = val_src.eq(input_tokenizer.pad_id)
+                val_tgt = val_bt.tgt.to(device)
+                logits = model(val_src, val_mask)
+                val_loss = loss_fn(
+                    logits.view(-1, logits.size(-1)),
+                    val_tgt.view(-1),
+                )
+                val_loss_total += val_loss.item()
+                val_batches += 1
+
+                pred_digits = torch.argmax(logits, dim=-1).cpu().tolist()
+                for seq in pred_digits:
+                    preds_all.append(digits_to_string(seq))
+                targets_all.extend(val_batch["target_text"])
+                inputs_all.extend(val_batch["input_text"])
+
+        avg_val_loss = val_loss_total / max(val_batches, 1)
+        em_batch = compute_metrics(preds_all, targets_all)
+        pbar.write(
+            f"[epoch {epoch_idx}] val_loss={avg_val_loss:.4f} "
+            f"EM={em_batch['EM']:.3f} TES={em_batch['TES']:.3f}"
+        )
+        pbar.set_postfix(
+            train_loss=f"{latest_train_loss:.4f}" if latest_train_loss is not None else "-",
+            val_loss=f"{avg_val_loss:.4f}",
+            EM=f"{em_batch['EM']:.3f}",
+            TES=f"{em_batch['TES']:.3f}",
+        )
+        pbar.refresh()
+
+        if train_config.save_best_path is not None:
+            current_em = float(em_batch.get("EM", -1.0))
+            if current_em > best_em:
+                best_em = current_em
+                ckpt = {
+                    "model_state": model.state_dict(),
+                    "optim_state": optim.state_dict(),
+                    "step": step,
+                    "train_config": train_config.__dict__,
+                    "model_config": model_config.__dict__,
+                    "tokenizer_config": tokenizer_config.__dict__,
+                }
+                torch.save(ckpt, train_config.save_best_path)
+                pbar.write(f"New best EM={best_em:.3f} at step {step}; saved to {train_config.save_best_path}")
+
+        B = len(preds_all)
+        n_show = min(train_config.show_valid_samples, B)
+        pbar.write("Sample validation output:")
+        for i in range(n_show):
+            input_str = inputs_all[i]
+            tgt = targets_all[i]
+            pred = preds_all[i]
+            ok = "OK" if pred == tgt else "ERR"
+            pbar.write(f"  [{i}] {ok} | input: {input_str} | target: {tgt} | pred: {pred}")
+        model.train()
+        return avg_val_loss, em_batch
+
+    max_steps_reached = False
     for epoch in range(train_config.num_epochs):
         # max_train_steps 제한이 있을 시, 제한을 다 채우면 학습을 종료합니다.
-        if train_config.max_train_steps is not None and step >= train_config.max_train_steps: break
+        if train_config.max_train_steps is not None and step >= train_config.max_train_steps:
+            break
         pbar.write(f"Starting epoch {epoch + 1}/{train_config.num_epochs}")
 
         # 실제로 배치를 하나씩 뽑아서 학습하는 부분입니다.
@@ -88,6 +171,8 @@ def train_loop(
                 logits.view(-1, logits.size(-1)),  # (B*T, V)
                 target_digits.view(-1),             # (B*T,)
             )
+            train_loss = loss.item()
+            latest_train_loss = train_loss
 
             # --------------------------------------------------------------
             # 5) Backward + optimizer step
@@ -98,81 +183,18 @@ def train_loop(
             optim.zero_grad()
 
             step += 1 
+            pbar.set_postfix(train_loss=f"{train_loss:.4f}")
+            pbar.update(1)
 
-            # --------------------------------------------------------------
-            # 6) Validation
-            # --------------------------------------------------------------
-            if step % train_config.valid_every == 0:
-                model.eval()  # 평가 모드
-                # 검증 데이터셋을 순회하며 각 배치에 대해 검증을 수행합니다.
-                with torch.no_grad():
-                    preds_all: List[str] = []
-                    targets_all: List[str] = []
-                    inputs_all: List[str] = [] # 검증 데이터셋의 입력, 정답, 예측 결과를 저장할 리스트
-
-                    for val_batch in val_dataloader: # 검증 데이터셋을 순회하며 각 배치에 대해 검증을 수행합니다.
-                        val_bt = tokenize_batch(
-                            val_batch,
-                            input_tokenizer,
-                            output_tokenizer,
-                            max_input_length=tokenizer_config.max_input_length,
-                            max_output_length=tokenizer_config.max_output_length,
-                        )
-                        val_src = val_bt.src.to(device)
-                        val_mask = val_src.eq(input_tokenizer.pad_id)
-                        logits = model(val_src, val_mask)
-                        pred_digits = torch.argmax(logits, dim=-1).cpu().tolist()
-                        for seq in pred_digits:
-                            preds_all.append(digits_to_string(seq))
-                        # 검증 데이터셋의 정답, 입력을 리스트에 추가합니다.
-                        targets_all.extend(val_batch["target_text"])
-                        inputs_all.extend(val_batch["input_text"])
-
-                    # 검증 데이터셋의 예측, 정답을 사용하여 성능 지표를 계산합니다.
-                    em_batch = compute_metrics(preds_all, targets_all)
-
-                    # 진행바에도 성능을 표시합니다.
-                    pbar.write(f"[valid {step}] EM={em_batch['EM']:.3f} TES={em_batch['TES']:.3f}")
-                    pbar.set_postfix(
-                        EM=f"{em_batch['EM']:.3f}",
-                        TES=f"{em_batch['TES']:.3f}",
-                    )
-                    
-                    pbar.refresh()
-
-                    # 최고 성능 갱신 시 전체 체크포인트 저장
-                    if train_config.save_best_path is not None:
-                        current_em = float(em_batch.get("EM", -1.0))
-                        if current_em > best_em:
-                            best_em = current_em
-                            # 세 config를 dict로 변환하여 저장
-                            ckpt = {
-                                "model_state": model.state_dict(),
-                                "optim_state": optim.state_dict(),
-                                "step": step,
-                                "train_config": train_config.__dict__,  # 학습 설정 저장
-                                "model_config": model_config.__dict__,  # 모델 설정 저장
-                                "tokenizer_config": tokenizer_config.__dict__,  # 토크나이저 설정 저장
-                            }
-                            torch.save(ckpt, train_config.save_best_path)
-                            pbar.write(f"New best EM={best_em:.3f} at step {step}; saved to {train_config.save_best_path}")
-
-                    B = len(preds_all) # 검증 데이터셋의 크기
-                    n_show = min(train_config.show_valid_samples, B)
-                    pbar.write("Sample validation output:") # 예시로 몇 개만 보여줍니다.
-                    for i in range(n_show):
-                        input_str = inputs_all[i]
-                        tgt = targets_all[i]
-                        pred = preds_all[i]
-                        ok = "OK" if pred == tgt else "ERR"
-                        pbar.write(f"  [{i}] {ok} | input: {input_str} | target: {tgt} | pred: {pred}")
-                model.train()  # 다시 학습 모드로
-
-            # max_train_steps 제한이 있을 시, 제한을 다 채우면 학습을 종료합니다.
             if train_config.max_train_steps is not None and step >= train_config.max_train_steps:
+                max_steps_reached = True
                 break # 학습을 종료합니다.
 
-            pbar.update(1) # tqdm 진행 1 step
+        if val_dataloader is not None:
+            run_validation(epoch + 1)
+
+        if max_steps_reached:
+            break
 
 # ======================================================================================
 # 2. main 함수
@@ -228,7 +250,7 @@ def main():
         output_chars=OUTPUT_CHARS,
         add_special=True,
         max_input_length=64,
-        max_output_length=8,
+        max_output_length=20,
     )
 
     # --------------------------------------------------------------------------
