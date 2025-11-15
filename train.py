@@ -7,6 +7,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
 
+import numpy as np
+
 from dataloader import (
     ArithmeticDataset,  # 사칙연산 데이터를 만들어주는 Dataset
     get_dataloader,     # Dataset을 받아서 DataLoader로 바꿔주는 함수
