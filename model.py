@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from typing import List, Dict, Any
-
 from dataclasses import dataclass
 
+import math
 import torch
 import torch.nn as nn
 
@@ -13,28 +13,18 @@ from do_not_edit.model_template import BaseModel
 # Tokenizer (통합 버전)
 # ========================
 
-# 특수 토큰 정의
 PAD = "<pad>"
 BOS = "<bos>"
 EOS = "<eos>"
 
-# 규정에 맞는 입력/출력 문자 집합
-# INPUT_CHARS: 수식 입력에 사용 가능한 모든 문자 (숫자, 연산자, 괄호, 공백)
-# OUTPUT_CHARS: 모델이 출력할 수 있는 문자 (숫자만)
 INPUT_CHARS = list("0123456789+-*/() =")
 OUTPUT_CHARS = list("0123456789")
 
 
 class CharTokenizer:
-    """
-    문자 단위 토크나이저
-    
-    문자열을 문자 단위로 분해하여 정수 인덱스로 변환하는 토크나이저입니다.
-    Seq2Seq 모델의 입력/출력을 처리하기 위해 사용됩니다.
-    """
-
     def __init__(self, chars: List[str], add_special: bool):
         vocab = list(chars)
+
         self.pad = PAD if add_special else None
         self.bos = BOS if add_special else None
         self.eos = EOS if add_special else None
@@ -51,23 +41,26 @@ class CharTokenizer:
             ids.append(self.stoi[self.bos])
 
         for ch in s:
-            idx = self.stoi.get(ch)
+            idx = self.stoi.get(ch, None)
             if idx is None:
                 raise ValueError(f"Unknown char '{ch}' for tokenizer.")
             ids.append(idx)
 
         if add_bos_eos and self.eos is not None:
             ids.append(self.stoi[self.eos])
+
         return ids
 
     def decode(self, ids: List[int], strip_special: bool = True) -> str:
         s = "".join(self.itos[i] for i in ids if i in self.itos)
+
         if strip_special and self.bos:
             s = s.replace(self.bos, "")
         if strip_special and self.eos:
             s = s.replace(self.eos, "")
         if strip_special and self.pad:
             s = s.replace(self.pad, "")
+
         return s
 
     @property
@@ -89,248 +82,408 @@ class CharTokenizer:
 
 @dataclass
 class BatchTensors:
-    """
-    배치 처리용 텐서 컨테이너
-    
-    Attributes:
-        src: 토큰 인덱스 텐서 [batch_size, seq_len]
-        tgt: 고정 길이 숫자 시퀀스 [batch_size, max_output_len]
-    """
-
-    src: torch.Tensor
-    tgt: torch.Tensor
+    src: torch.Tensor      # [B, S]
+    tgt_inp: torch.Tensor  # [B, T]
+    tgt_out: torch.Tensor  # [B, T]
 
 
-def _pad(seqs: List[List[int]], pad_id: int, fixed_len: int | None = None) -> torch.Tensor:
-    if fixed_len is not None:
-        L = fixed_len
-    else:
-        L = max(len(s) for s in seqs) if seqs else 1
-
+def _pad(seqs: List[List[int]], pad_id: int) -> torch.Tensor:
+    L = max(len(s) for s in seqs) if len(seqs) > 0 else 1
     out = torch.full((len(seqs), L), pad_id, dtype=torch.long)
     for i, s in enumerate(seqs):
-        if s:
-            length = min(len(s), L)
-            out[i, :length] = torch.tensor(s[:length], dtype=torch.long)
+        if len(s) > 0:
+            out[i, :len(s)] = torch.tensor(s, dtype=torch.long)
     return out
-
-
-def digits_to_string(digits: List[int]) -> str:
-    """0~9 리스트를 문자열로 변환 (선행 0 제거, 전부 0이면 '0')."""
-    chars = "".join(str(max(0, min(9, int(d)))) for d in digits)
-    stripped = chars.lstrip("0")
-    return stripped if stripped else "0"
 
 
 def tokenize_batch(
     batch: Dict[str, List[str]],
     input_tokenizer: CharTokenizer,
     output_tokenizer: CharTokenizer,
-    *,
-    max_input_length: int,
-    max_output_length: int,
 ) -> BatchTensors:
-    """
-    배치 데이터를 토크나이징하여 모델 입력용 텐서로 변환.
-    
-    출력 숫자는 왼쪽을 0으로 패딩하여 길이를 고정합니다.
-    """
-    del output_tokenizer  # 인터페이스 유지용 (digits 직접 처리)
+    # 입력 인코딩 (BOS/EOS 없이)
+    src_ids = [input_tokenizer.encode(s, add_bos_eos=False) for s in batch["input_text"]]
 
-    src_ids: List[List[int]] = []
-    for raw in batch["input_text"]:
-        ids = input_tokenizer.encode(raw, add_bos_eos=False)
-        if not ids:
-            raise ValueError(f"Empty tokenized source for input '{raw}'")
-        if len(ids) > max_input_length:
-            ids = ids[:max_input_length]
-        src_ids.append(ids)
+    empty_indices = [i for i, seq in enumerate(src_ids) if len(seq) == 0]
+    if empty_indices:
+        inputs = [batch["input_text"][i] for i in empty_indices]
+        raise ValueError(f"Empty tokenized source at indices {empty_indices}; inputs: {inputs}")
 
-    src = _pad(src_ids, input_tokenizer.pad_id, fixed_len=max_input_length)
+    # 타겟 입력: BOS + target_text
+    # 타겟 출력: target_text + EOS
+    tgt_inp_ids = []
+    tgt_out_ids = []
+    for t in batch["target_text"]:
+        base_ids = output_tokenizer.encode(t, add_bos_eos=False)
+        inp_ids = [output_tokenizer.bos_id] + base_ids
+        out_ids = base_ids + [output_tokenizer.eos_id]
+        tgt_inp_ids.append(inp_ids)
+        tgt_out_ids.append(out_ids)
 
-    tgt_ids: List[List[int]] = []
-    for raw_target in batch["target_text"]:
-        target = raw_target.strip()
-        if not target.isdigit():
-            raise ValueError(f"Target '{raw_target}' is not a non-negative integer string.")
-        if len(target) > max_output_length:
-            raise ValueError(
-                f"Target '{raw_target}' exceeds max_output_length={max_output_length}."
-            )
-        padded = target.rjust(max_output_length, "0")
-        tgt_ids.append([int(ch) for ch in padded])
+    src = _pad(src_ids, input_tokenizer.pad_id)
+    tgt_inp = _pad(tgt_inp_ids, output_tokenizer.pad_id)
+    tgt_out = _pad(tgt_out_ids, output_tokenizer.pad_id)
 
-    tgt = torch.tensor(tgt_ids, dtype=torch.long)
-    return BatchTensors(src=src, tgt=tgt)
+    return BatchTensors(src=src, tgt_inp=tgt_inp, tgt_out=tgt_out)
 
 
 # ========================
-# Transformer Encoder
+# Positional Encoding (absolute, for embeddings)
 # ========================
 
-
-class RelativePositionBias(nn.Module):
-    """거리 기반 상대 위치 bias."""
-
-    def __init__(self, num_heads: int, max_distance: int):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 512):
         super().__init__()
-        self.num_heads = num_heads
-        self.max_distance = max_distance
-        self.bias = nn.Embedding(2 * max_distance + 1, num_heads)
+        # pe = torch.zeros(max_len, d_model)
+        # position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        # div_term = torch.exp(
+        #     torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+        # )
+        # pe[:, 0::2] = torch.sin(position * div_term)
+        # pe[:, 1::2] = torch.cos(position * div_term)
+        # pe = pe.unsqueeze(0)
+        # self.register_buffer("pe", pe)
 
-    def forward(self, q_len: int, k_len: int) -> torch.Tensor:
-        device = self.bias.weight.device
-        context = torch.arange(q_len, device=device).unsqueeze(1)
-        memory = torch.arange(k_len, device=device).unsqueeze(0)
-        relative = memory - context
-        relative = relative.clamp(-self.max_distance, self.max_distance) + self.max_distance
-        values = self.bias(relative)
-        return values.permute(2, 0, 1)  # [num_heads, q_len, k_len]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # L = x.size(1)
+        # return x + self.pe[:, :L, :]
+        return x
 
 
-class RelativeSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, dropout: float, max_rel_distance: int):
+# ========================
+# RoPE 구현부
+# ========================
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, max_position: int = 2048):
         super().__init__()
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads.")
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.dim = dim
+        self.max_position = max_position
+
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_position, dtype=torch.float32).unsqueeze(1)
+        freqs = t * inv_freq.unsqueeze(0)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos())
+        self.register_buffer("sin_cached", emb.sin())
+
+    def forward(self, seq_len: int, device: torch.device):
+        cos = self.cos_cached[:seq_len, :].to(device)
+        sin = self.sin_cached[:seq_len, :].to(device)
+        return cos, sin
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., : x.size(-1) // 2], x[..., x.size(-1) // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    cos = cos.unsqueeze(0).unsqueeze(2)   # [1, L, 1, D]
+    sin = sin.unsqueeze(0).unsqueeze(2)
+    return (x * cos) + (rotate_half(x) * sin)
+
+
+class RoPEMultiheadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, nhead: int, max_position: int = 2048, dropout: float = 0.0):
+        super().__init__()
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
+
+        self.rotary = RotaryEmbedding(self.head_dim, max_position=max_position)
         self.dropout = nn.Dropout(dropout)
-        self.rel_bias = RelativePositionBias(num_heads, max_rel_distance)
 
-    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
-        B, L, _ = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+    def forward(
+        self,
+        x: torch.Tensor,                      # [B, L, D]
+        attn_mask: torch.Tensor | None = None,   # [L, L]
+        key_padding_mask: torch.Tensor | None = None,  # [B, L]
+    ) -> torch.Tensor:
+        B, L, D = x.size()
+        device = x.device
 
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        bias = self.rel_bias(L, L)
-        attn_scores = attn_scores + bias.unsqueeze(0)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(B, L, self.nhead, self.head_dim)
+        k = k.view(B, L, self.nhead, self.head_dim)
+        v = v.view(B, L, self.nhead, self.head_dim)
+
+        cos, sin = self.rotary(L, device)
+        q = apply_rotary_pos_emb(q, cos, sin)
+        k = apply_rotary_pos_emb(k, cos, sin)
+
+        q = q.permute(0, 2, 1, 3)  # [B, H, L, D]
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                scores = scores.masked_fill(attn_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            else:
+                scores = scores + attn_mask.unsqueeze(0).unsqueeze(0)
 
         if key_padding_mask is not None:
-            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores = attn_scores.masked_fill(mask, float("-inf"))
+            scores = scores.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf")
+            )
 
-        attn = torch.softmax(attn_scores, dim=-1)
+        attn = torch.softmax(scores, dim=-1)
         attn = self.dropout(attn)
 
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, L, -1)
-        return self.out_proj(out)
+        out = torch.matmul(attn, v)  # [B, H, L, D]
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, L, D)
+        out = self.out_proj(out)
+        return out
 
 
-class TransformerEncoderLayer(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        dim_feedforward: int,
-        dropout: float,
-        max_rel_distance: int,
-    ):
+class EncoderLayerRoPE(nn.Module):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float = 0.1, max_position: int = 2048):
         super().__init__()
-        self.self_attn = RelativeSelfAttention(d_model, num_heads, dropout, max_rel_distance)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-
+        self.self_attn = RoPEMultiheadSelfAttention(
+            d_model=d_model,
+            nhead=nhead,
+            max_position=max_position,
+            dropout=dropout,
+        )
         self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.activation = nn.GELU()
-        self.dropout_ff = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.dropout2 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
 
     def forward(self, src: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
-        attn_out = self.self_attn(src, key_padding_mask=src_key_padding_mask)
-        src = src + self.dropout1(attn_out)
+        src2 = self.self_attn(src, attn_mask=None, key_padding_mask=src_key_padding_mask)
+        src = src + self.dropout1(src2)
         src = self.norm1(src)
 
-        ff = self.linear2(self.dropout_ff(self.activation(self.linear1(src))))
-        src = src + self.dropout2(ff)
+        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
+        src = src + src2
         src = self.norm2(src)
         return src
 
 
+class DecoderLayerRoPE(nn.Module):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float = 0.1, max_position: int = 2048):
+        super().__init__()
+        self.self_attn = RoPEMultiheadSelfAttention(
+            d_model=d_model,
+            nhead=nhead,
+            max_position=max_position,
+            dropout=dropout,
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = nn.ReLU()
+
+    def forward(
+        self,
+        tgt: torch.Tensor,                     # [B, T, D]
+        memory: torch.Tensor,                  # [B, S, D]
+        tgt_mask: torch.Tensor | None = None,  # [T, T]
+        tgt_key_padding_mask: torch.Tensor | None = None,    # [B, T]
+        memory_key_padding_mask: torch.Tensor | None = None, # [B, S]
+    ) -> torch.Tensor:
+        tgt2 = self.self_attn(
+            tgt,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+        )
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        tgt2, _ = self.cross_attn(
+            query=tgt,
+            key=memory,
+            value=memory,
+            attn_mask=None,
+            key_padding_mask=memory_key_padding_mask,
+        )
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+        tgt = tgt + tgt2
+        tgt = self.norm3(tgt)
+        return tgt
+
+
 class TinySeq2Seq(nn.Module):
     """
-    Transformer Encoder 기반 모델.
-    CLS 토큰 표현 하나로 고정 길이 자리수 분류를 수행합니다.
+    RoPE 기반 Transformer encoder-decoder (이름은 TinySeq2Seq로 유지)
     """
-
     def __init__(self, in_vocab: int, out_vocab: int, **kwargs):
         super().__init__()
-
         d_model = kwargs.get("d_model", 256)
-        num_heads = kwargs.get("num_heads", 8)
-        num_layers = kwargs.get("num_layers", 4)
+        nhead = kwargs.get("nhead", 8)
+        num_encoder_layers = kwargs.get("num_encoder_layers", 3)
+        num_decoder_layers = kwargs.get("num_decoder_layers", 3)
         dim_feedforward = kwargs.get("dim_feedforward", 512)
         dropout = kwargs.get("dropout", 0.1)
-        max_rel_distance = kwargs.get("max_rel_distance", 64)
-        self.output_length = kwargs.get("output_length", 8)
+        max_position = kwargs.get("max_position", 2048)
 
-        self.embed_in = nn.Embedding(in_vocab, d_model)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.d_model = d_model
 
-        self.layers = nn.ModuleList(
-            [
-                TransformerEncoderLayer(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    dim_feedforward=dim_feedforward,
-                    dropout=dropout,
-                    max_rel_distance=max_rel_distance,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.norm = nn.LayerNorm(d_model)
+        self.embed_in = nn.Embedding(in_vocab, d_model, padding_idx=0)
+        self.embed_out = nn.Embedding(out_vocab, d_model, padding_idx=0)
 
-        self.num_digit_classes = len(OUTPUT_CHARS)
-        self.classifier = nn.Linear(d_model, self.output_length * self.num_digit_classes)
+        self.pos_enc_in = PositionalEncoding(d_model)
+        self.pos_enc_out = PositionalEncoding(d_model)
 
-    def forward(self, src: torch.Tensor, src_pad_mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = self.embed_in(src)
-        B = x.size(0)
-        cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1)
+        self.encoder_layers = nn.ModuleList([
+            EncoderLayerRoPE(d_model, nhead, dim_feedforward, dropout, max_position=max_position)
+            for _ in range(num_encoder_layers)
+        ])
+        self.decoder_layers = nn.ModuleList([
+            DecoderLayerRoPE(d_model, nhead, dim_feedforward, dropout, max_position=max_position)
+            for _ in range(num_decoder_layers)
+        ])
 
-        if src_pad_mask is not None:
-            cls_mask = torch.zeros((B, 1), dtype=torch.bool, device=src.device)
-            full_mask = torch.cat([cls_mask, src_pad_mask], dim=1)
+        self.out_proj = nn.Linear(d_model, out_vocab)
+
+    def _generate_square_subsequent_mask(self, sz: int, device: torch.device) -> torch.Tensor:
+        return torch.triu(torch.ones(sz, sz, device=device, dtype=torch.bool), diagonal=1)
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        tgt_inp: torch.Tensor,
+        src_pad_id: int,
+        tgt_pad_id: int | None = None,
+        teacher_forcing: float = 1.0,
+    ) -> torch.Tensor:
+        device = src.device
+
+        # encoder
+        src_emb = self.embed_in(src) * math.sqrt(self.d_model)
+        src_emb = self.pos_enc_in(src_emb)
+        src_key_padding_mask = (src == src_pad_id)
+
+        memory = src_emb
+        for layer in self.encoder_layers:
+            memory = layer(memory, src_key_padding_mask=src_key_padding_mask)
+
+        # decoder
+        tgt_emb = self.embed_out(tgt_inp) * math.sqrt(self.d_model)
+        tgt_emb = self.pos_enc_out(tgt_emb)
+
+        T = tgt_inp.size(1)
+        tgt_mask_bool = self._generate_square_subsequent_mask(T, device)
+
+        if tgt_pad_id is not None:
+            tgt_key_padding_mask = (tgt_inp == tgt_pad_id)
         else:
-            full_mask = None
+            tgt_key_padding_mask = None
 
-        for layer in self.layers:
-            x = layer(x, src_key_padding_mask=full_mask)
+        out = tgt_emb
+        for layer in self.decoder_layers:
+            out = layer(
+                tgt=out,
+                memory=memory,
+                tgt_mask=tgt_mask_bool,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=src_key_padding_mask,
+            )
 
-        x = self.norm(x)
-        cls_repr = x[:, 0, :]
-        logits = self.classifier(cls_repr)
-        logits = logits.view(B, self.output_length, self.num_digit_classes)
+        logits = self.out_proj(out)
         return logits
 
+    @torch.no_grad()
+    def generate(
+        self,
+        src: torch.Tensor,
+        max_len: int,
+        bos_id: int,
+        eos_id: int,
+        src_pad_id: int,
+    ) -> torch.Tensor:
+        device = src.device
+        B = src.size(0)
+
+        src_emb = self.embed_in(src) * math.sqrt(self.d_model)
+        src_emb = self.pos_enc_in(src_emb)
+        src_key_padding_mask = (src == src_pad_id)
+
+        memory = src_emb
+        for layer in self.encoder_layers:
+            memory = layer(memory, src_key_padding_mask=src_key_padding_mask)
+
+        generated = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        outputs = []
+
+        for _ in range(max_len):
+            tgt_emb = self.embed_out(generated) * math.sqrt(self.d_model)
+            tgt_emb = self.pos_enc_out(tgt_emb)
+
+            t = generated.size(1)
+            tgt_mask_bool = self._generate_square_subsequent_mask(t, device)
+
+            out = tgt_emb
+            for layer in self.decoder_layers:
+                out = layer(
+                    tgt=out,
+                    memory=memory,
+                    tgt_mask=tgt_mask_bool,
+                    tgt_key_padding_mask=None,
+                    memory_key_padding_mask=src_key_padding_mask,
+                )
+
+            logits = self.out_proj(out[:, -1, :])
+            next_token = torch.argmax(logits, dim=-1)
+
+            outputs.append(next_token)
+            generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
+
+            finished |= (next_token == eos_id)
+            if torch.all(finished):
+                break
+
+        if outputs:
+            return torch.stack(outputs, dim=1)
+        return torch.empty((B, 0), dtype=torch.long, device=device)
+
 
 # ========================
-# InThon 규정용 Model
+# InThon 제출용 래퍼
 # ========================
-
 
 class Model(BaseModel):
-    """
-    InThon Datathon 제출용 Model 클래스
-    """
-
     def __init__(self) -> None:
         super().__init__()
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = torch.load("best_model.pt", map_location=self.device)
+        CKPT_PATH = "best_model.pt"
+
+        checkpoint = torch.load(CKPT_PATH, map_location=self.device)
 
         tokenizer_config_dict = checkpoint.get("tokenizer_config")
         if tokenizer_config_dict is None:
@@ -339,8 +492,6 @@ class Model(BaseModel):
         input_chars = tokenizer_config_dict.get("input_chars", INPUT_CHARS)
         output_chars = tokenizer_config_dict.get("output_chars", OUTPUT_CHARS)
         add_special = tokenizer_config_dict.get("add_special", True)
-        self.max_input_length = tokenizer_config_dict.get("max_input_length", 64)
-        self.max_output_length = tokenizer_config_dict.get("max_output_length", 8)
 
         self.input_tokenizer = CharTokenizer(
             input_chars if input_chars is not None else INPUT_CHARS,
@@ -355,9 +506,6 @@ class Model(BaseModel):
         if model_config_dict is None:
             raise ValueError("체크포인트에 'model_config'가 없습니다.")
 
-        model_config_dict = dict(model_config_dict)
-        model_config_dict.setdefault("output_length", self.max_output_length)
-
         self.model = TinySeq2Seq(
             in_vocab=self.input_tokenizer.vocab_size,
             out_vocab=self.output_tokenizer.vocab_size,
@@ -366,6 +514,11 @@ class Model(BaseModel):
 
         model_state = checkpoint.get("model_state", checkpoint)
         self.model.load_state_dict(model_state)
+
+        train_config_dict = checkpoint.get("train_config") or {}
+        self.max_len = int(train_config_dict.get("max_gen_len", 50))
+        if self.max_len <= 0:
+            self.max_len = 50
         self.model.eval()
 
     def predict(self, input_text: str) -> str:
@@ -373,20 +526,31 @@ class Model(BaseModel):
             input_text = str(input_text)
 
         batch = {"input_text": [input_text], "target_text": ["0"]}
-        batch_tensors = tokenize_batch(
-            batch,
-            self.input_tokenizer,
-            self.output_tokenizer,
-            max_input_length=self.max_input_length,
-            max_output_length=self.max_output_length,
-        )
 
+        batch_tensors = tokenize_batch(batch, self.input_tokenizer, self.output_tokenizer)
         src = batch_tensors.src.to(self.device)
-        pad_mask = src.eq(self.input_tokenizer.pad_id)
 
         with torch.no_grad():
-            logits = self.model(src, pad_mask)
-            preds = torch.argmax(logits, dim=-1)
+            gens = self.model.generate(
+                src=src,
+                max_len=self.max_len,
+                bos_id=self.output_tokenizer.bos_id,
+                eos_id=self.output_tokenizer.eos_id,
+                src_pad_id=self.input_tokenizer.pad_id,
+            )
 
-        pred_str = digits_to_string(preds[0].tolist())
-        return pred_str if pred_str.isdigit() else ""
+        preds: List[str] = []
+        for i in range(gens.size(0)):
+            seq_chars: List[str] = []
+            for t in gens[i].tolist():
+                idx = int(t)
+                if idx == self.output_tokenizer.eos_id:
+                    break
+                if idx in self.output_tokenizer.itos:
+                    ch = self.output_tokenizer.itos[idx]
+                    if ch.isdigit():
+                        seq_chars.append(ch)
+            preds.append("".join(seq_chars))
+
+        pred = preds[0] if preds else ""
+        return pred if pred.isdigit() else ""
