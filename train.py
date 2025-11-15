@@ -59,7 +59,10 @@ def train_loop(
     law_lambda = getattr(train_config, "law_lambda", 0.0)
     law_num_variants = max(1, getattr(train_config, "law_num_variants", 1))
     law_max_pairs = getattr(train_config, "law_max_pairs_per_batch", 0)
-    law_rng = random.Random(getattr(train_config, "law_seed", 0))
+    law_seed = getattr(train_config, "law_seed", 0)
+    law_rng = random.Random(law_seed)
+    law_cache_rng = random.Random(law_seed)
+    law_variant_cache: Dict[str, List[str]] = {}
 
     # 옵티마이저: AdamW는 Adam + weight decay가 들어간 버전
     optim = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
@@ -67,6 +70,44 @@ def train_loop(
     # seq2seq에서 흔히 쓰는 CE loss
     # pad 토큰은 무시하도록(ignore_index) 설정
     loss_fn = nn.CrossEntropyLoss(ignore_index=output_tokenizer.pad_id)
+
+    def _generate_variants(expr: str) -> List[str]:
+        try:
+            variants = generate_equivalents(
+                expr,
+                num_variants=law_num_variants,
+                seed=law_cache_rng.randint(0, 1_000_000_000),
+            )
+        except Exception:
+            return []
+        return [v for v in variants if v != expr]
+
+    def _precompute_law_variants():
+        if law_lambda <= 0:
+            return
+        dataset = getattr(dataloader, "dataset", None)
+        if dataset is None or isinstance(dataset, IterableDataset):
+            return
+        try:
+            total = len(dataset)
+        except TypeError:
+            total = None
+        if not total:
+            return
+        pre_pbar = tqdm(range(total), desc="law aug precompute", leave=False)
+        for idx in pre_pbar:
+            sample = dataset[idx]
+            if isinstance(sample, dict):
+                expr = sample.get("input_text")
+            else:
+                expr = None
+            if not isinstance(expr, str) or expr in law_variant_cache:
+                continue
+            law_variant_cache[expr] = _generate_variants(expr)
+        pre_pbar.close()
+
+    _precompute_law_variants()
+    law_rng = random.Random(law_seed)
 
     def _sample_law_pairs(batch_dict: Dict[str, List[str]]):
         """배치에서 augmentation 변형을 뽑아 (idx, variant, target)을 반환."""
@@ -86,20 +127,19 @@ def train_loop(
         pairs = []
         for idx in indices:
             expr = inputs[idx]
-            try:
-                variants = generate_equivalents(
-                    expr,
-                    num_variants=law_num_variants,
-                    seed=law_rng.randint(0, 1_000_000_000),
-                )
-            except Exception:
+            variants = law_variant_cache.get(expr)
+            if variants is None:
+                variants = _generate_variants(expr)
+                law_variant_cache[expr] = variants
+            if not variants:
                 continue
 
-            filtered = [v for v in variants if v != expr]
-            if not filtered:
-                continue
+            if len(variants) <= law_num_variants:
+                chosen = variants
+            else:
+                chosen = law_rng.sample(variants, law_num_variants)
 
-            for variant in filtered[:law_num_variants]:
+            for variant in chosen:
                 pairs.append((idx, variant, targets[idx]))
                 if len(pairs) >= max_pairs:
                     return pairs
@@ -165,6 +205,21 @@ def train_loop(
                     aug_tensors = tokenize_batch(aug_batch, input_tokenizer, output_tokenizer)
                     aug_src = aug_tensors.src.to(device)
                     aug_target_input = aug_tensors.tgt_inp.to(device)
+                    target_seq_len = target_input.size(1)
+                    aug_len = aug_target_input.size(1)
+                    if aug_len != target_seq_len:
+                        pad_token_id = output_tokenizer.pad_id if output_tokenizer.pad_id is not None else 0
+                        if aug_len < target_seq_len:
+                            pad_shape = (aug_target_input.size(0), target_seq_len - aug_len)
+                            pad_tensor = torch.full(
+                                pad_shape,
+                                pad_token_id,
+                                dtype=aug_target_input.dtype,
+                                device=device,
+                            )
+                            aug_target_input = torch.cat([aug_target_input, pad_tensor], dim=1)
+                        else:
+                            aug_target_input = aug_target_input[:, :target_seq_len]
                     aug_logits = model(aug_src, aug_target_input, input_tokenizer.pad_id)
 
                     ref_indices = torch.tensor([idx for idx, _, _ in law_pairs], dtype=torch.long, device=device)
