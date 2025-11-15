@@ -19,51 +19,55 @@ def _rand_int(rng: random.Random, num_digits: Tuple[int, int]) -> int:
     return int(str(first) + "".join(str(x) for x in rest))
 
 
-def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int],
-              number_factor: float = 0.5, term_factor: float = 0.5) -> Tuple[str, int]:
-    """재귀적 수식 생성 (연산자 우선순위 반영)"""
+def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]):
+    """exact depth의 arithmetic expression 생성"""
     
-    def number() -> Tuple[str, int]:
+    def number():
         v = _rand_int(rng, num_digits)
         return str(v), v
-    
-    def factor(d: int) -> Tuple[str, int]:
-        if d == 0 or rng.random() < number_factor:
+
+    def random_split(total):
+        if total <= 0:
+            return 0, 0
+        left = rng.randint(0, total - 1)
+        right = total - 1 - left
+        return left, right
+
+    def expr(d):
+        if d == 0:
             return number()
-        e, v = expr(d - 1)
-        return f"({e})", v
-    
-    def term(d: int) -> Tuple[str, int]:
-        if d == 0 or rng.random() < term_factor:
-            return factor(d)
-        
-        op = rng.choice(["*", "//"])
-        le, lv = term(rng.randint(0, d - 1))
-        re, rv = factor(rng.randint(0, d - 1))
-        
-        if op == "//" and rv == 0:
-            rv = rng.randint(1, 9)
-            re = str(rv)
-        
-        v = lv // rv if op == "//" else lv * rv
-        return f"{le}{op}{re}", v
-    
-    def expr(d: int) -> Tuple[str, int]:
-        if d == 0 or rng.random() < term_factor:
-            return term(d)
-        
-        op = rng.choice(["+", "-"])
-        le, lv = expr(rng.randint(0, d - 1))
-        re, rv = term(rng.randint(0, d - 1))
-        
+
+        op = rng.choice(["+", "-", "*", "//"])
+        left, right = random_split(d)
+        le, lv = expr(left)
+        re, rv = expr(right)
+
         # 음수 방지
         if op == "-" and lv < rv:
             lv, rv = rv, lv
             le, re = re, le
         
-        v = lv + rv if op == "+" else lv - rv
-        return f"{le}{op}{re}", v
-    
+        if op == "*":
+            v = lv * rv
+        elif op == "//":
+            # 0으로 나누기 방지
+            if rv == 0:
+                rv = 2
+                re = "2"
+            v = lv // rv
+        elif op == "+":
+            v = lv + rv
+        else:  # op == "-"
+            if lv < rv:
+                lv, rv = rv, lv
+                le, re = re, le
+            v = lv - rv
+
+        if rng.random() < 0.5:
+            return f"({le}{op}{re})", v
+        else:
+            return f"{le}{op}{re}", v
+
     return expr(depth)
 
 
