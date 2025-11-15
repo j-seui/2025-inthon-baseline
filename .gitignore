@@ -1,2 +1,5 @@
-*__pycache__/*
+__pycache__/*
+*.pyc
+*.pyo
+*$py.class
 .venv/
