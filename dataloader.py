@@ -83,20 +83,42 @@ class ArithmeticDataset(Dataset):
         seed: int = 42,
         mode: str = "train",
         mul_only: bool = False,
+        depth_weights: Union[None, Dict[int, float]] = None,
     ):
+        """
+        Args:
+            depth_weights: depth별 샘플링 가중치 딕셔너리
+                          예: {0: 0.1, 1: 0.2, 2: 0.7} → depth 0은 10%, 1은 20%, 2는 70%
+                          None이면 균등 분포 (기본값)
+        """
         self.num_samples = num_samples
         self.max_depth = max_depth
         self.num_digits = num_digits
         self.seed = seed
         self.mode = mode
         self.mul_only = mul_only
+        self.depth_weights = depth_weights
+        
+        # depth_weights 검증 및 정규화
+        if self.depth_weights is not None:
+            total = sum(self.depth_weights.values())
+            self.depth_weights = {k: v/total for k, v in self.depth_weights.items()}
+            # 누적 확률 계산 (weighted random choice용)
+            self.depth_choices = list(self.depth_weights.keys())
+            self.depth_probs = list(self.depth_weights.values())
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         rng = random.Random(self.seed + idx)
-        depth = rng.randint(0, self.max_depth)
+        
+        # depth 선택: depth_weights가 있으면 가중치 기반, 없으면 균등
+        if self.depth_weights is not None:
+            depth = rng.choices(self.depth_choices, weights=self.depth_probs, k=1)[0]
+        else:
+            depth = rng.randint(0, self.max_depth)
+        
         expr, val = _gen_expr(rng, depth, self.num_digits, self.mul_only)
         return {"input_text": expr, "target_text": str(val), "meta": {"depth": depth}}
 

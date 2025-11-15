@@ -149,13 +149,14 @@ def flatten_associative(node: Node) -> None:
 
 
 def apply_commutativity(node: Node, rng: random.Random) -> None:
-    """+, * 에서 자식 순서를 랜덤하게 섞기."""
+    """+, * 에서 자식 순서를 랜덤하게 섞기 (강화 버전)."""
     if node.kind != "op":
         return
     for c in node.children:
         apply_commutativity(c, rng)
     if node.op in ("+", "*") and len(node.children) > 1:
-        if rng.random() < 0.7:
+        # 확률을 0.7에서 0.95로 증가하여 거의 항상 교환
+        if rng.random() < 0.95:
             rng.shuffle(node.children)
 
 
@@ -307,6 +308,7 @@ def generate_equivalents(expr_str: str, num_variants: int = 5, seed: Optional[in
     """
     하나의 AE를 받아, 의미가 동일한 다른 AE들을 최대 num_variants개 생성.
     strict → minimal 두 단계로 보장.
+    교환법칙 증강 강화.
     """
     rng = random.Random(seed)
 
@@ -334,9 +336,18 @@ def generate_equivalents(expr_str: str, num_variants: int = 5, seed: Optional[in
 
         # 변환 적용
         flatten_associative(ast)
+        
+        # 교환법칙을 더 강하게 적용하기 위해 여러 번 호출
         apply_commutativity(ast, rng)
+        if rng.random() < 0.5:
+            apply_commutativity(ast, rng)  # 50% 확률로 한 번 더
+        
         ast = try_distribute(ast, rng)
         random_group_associative(ast, rng)
+        
+        # 교환법칙을 마지막에 한 번 더 적용
+        if rng.random() < 0.7:
+            apply_commutativity(ast, rng)
 
         # 안전하게 이항 normalize
         ast = binary_normalize(ast)
