@@ -34,10 +34,14 @@ def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]):
         else:
             child_prec = precedence[child_op]
             parent_prec = precedence[parent_op]
-            if is_left:
-                wrap = child_prec < parent_prec
-            else:
-                wrap = child_prec <= parent_prec
+            wrap = child_prec < parent_prec
+            if not wrap and child_prec == parent_prec:
+                if parent_op in ("-", "//") and not is_left:
+                    wrap = True
+                elif parent_op == "*" and child_op == "//" and not is_left:
+                    wrap = True
+                elif parent_op == "//" and child_op in ("*", "//") and not is_left:
+                    wrap = True
             if not wrap:
                 wrap = rng.random() < 0.15
         return f"({expr})" if wrap else expr
