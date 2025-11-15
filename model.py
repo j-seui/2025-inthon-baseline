@@ -165,155 +165,151 @@ def tokenize_batch(
 
 
 # ========================
-# Transformer Encoder
+# Dilated 1D CNN Encoder
 # ========================
 
+class DilatedConvBlock(nn.Module):
+    """
+    단일 Dilated 1D Conv 블록 (Pre-LN + Residual)
+    입력/출력 shape: [B, L, d_model]
+    """
 
-class RelativePositionBias(nn.Module):
-    """거리 기반 상대 위치 bias."""
-
-    def __init__(self, num_heads: int, max_distance: int):
+    def __init__(self, d_model: int, kernel_size: int, dilation: int, dropout: float):
         super().__init__()
-        self.num_heads = num_heads
-        self.max_distance = max_distance
-        self.bias = nn.Embedding(2 * max_distance + 1, num_heads)
+        self.d_model = d_model
+        self.kernel_size = kernel_size
+        self.dilation = dilation
 
-    def forward(self, q_len: int, k_len: int) -> torch.Tensor:
-        device = self.bias.weight.device
-        context = torch.arange(q_len, device=device).unsqueeze(1)
-        memory = torch.arange(k_len, device=device).unsqueeze(0)
-        relative = memory - context
-        relative = relative.clamp(-self.max_distance, self.max_distance) + self.max_distance
-        values = self.bias(relative)
-        return values.permute(2, 0, 1)  # [num_heads, q_len, k_len]
+        # Pre-LayerNorm
+        self.norm = nn.LayerNorm(d_model)
 
+        # Conv1d: 입력 [B, d_model, L] → 출력 [B, d_model, L]
+        padding = (kernel_size - 1) * dilation // 2
+        self.conv = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding,
+        )
 
-class RelativeSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, dropout: float, max_rel_distance: int):
-        super().__init__()
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads.")
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(d_model, 3 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout)
-        self.rel_bias = RelativePositionBias(num_heads, max_rel_distance)
 
-    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
-        B, L, _ = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, L, d_model]
+        """
+        residual = x
 
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        bias = self.rel_bias(L, L)
-        attn_scores = attn_scores + bias.unsqueeze(0)
+        # Pre-norm
+        x = self.norm(x)
 
-        if key_padding_mask is not None:
-            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores = attn_scores.masked_fill(mask, float("-inf"))
+        # [B, L, d_model] → [B, d_model, L]
+        x = x.transpose(1, 2)
 
-        attn = torch.softmax(attn_scores, dim=-1)
-        attn = self.dropout(attn)
+        # Conv1d
+        x = self.conv(x)
 
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, L, -1)
-        return self.out_proj(out)
+        # [B, d_model, L] → [B, L, d_model]
+        x = x.transpose(1, 2)
+
+        x = self.activation(x)
+        x = self.dropout(x)
+        return x + residual
 
 
-class TransformerEncoderLayer(nn.Module):
+class TinyCNNSeq2Seq(nn.Module):
+    """
+    Dilated 1D CNN 기반 Encoder + 자리별 digit 분류 모델.
+
+    - 입력: 토큰 인덱스 시퀀스 [B, T]
+    - 출력: 각 자릿수 0~9 분포 [B, output_length, num_digit_classes]
+    """
+
     def __init__(
         self,
-        d_model: int,
-        num_heads: int,
-        dim_feedforward: int,
-        dropout: float,
-        max_rel_distance: int,
+        in_vocab: int,
+        out_vocab: int,  # 사용은 안 하지만 인터페이스 유지용
+        pad_id: int | None = None,
+        **kwargs,
     ):
-        super().__init__()
-        self.self_attn = RelativeSelfAttention(d_model, num_heads, dropout, max_rel_distance)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.activation = nn.GELU()
-        self.dropout_ff = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm2 = nn.LayerNorm(d_model)
-
-    def forward(self, src: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
-        attn_out = self.self_attn(src, key_padding_mask=src_key_padding_mask)
-        src = src + self.dropout1(attn_out)
-        src = self.norm1(src)
-
-        ff = self.linear2(self.dropout_ff(self.activation(self.linear1(src))))
-        src = src + self.dropout2(ff)
-        src = self.norm2(src)
-        return src
-
-
-class TinySeq2Seq(nn.Module):
-    """
-    Transformer Encoder 기반 모델.
-    CLS 토큰 표현 하나로 고정 길이 자리수 분류를 수행합니다.
-    """
-
-    def __init__(self, in_vocab: int, out_vocab: int, **kwargs):
         super().__init__()
 
         d_model = kwargs.get("d_model", 256)
-        num_heads = kwargs.get("num_heads", 8)
-        num_layers = kwargs.get("num_layers", 4)
-        dim_feedforward = kwargs.get("dim_feedforward", 512)
         dropout = kwargs.get("dropout", 0.1)
-        max_rel_distance = kwargs.get("max_rel_distance", 64)
         self.output_length = kwargs.get("output_length", 8)
 
-        self.embed_in = nn.Embedding(in_vocab, d_model)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        # dilations: [1, 2, 4, 8] 같은 리스트를 config로 받되, 없으면 기본값
+        dilations = kwargs.get("dilations", [1, 2, 4, 8])
+        kernel_size = kwargs.get("kernel_size", 3)
 
+        # 임베딩: padding_idx를 설정해두면 PAD 토큰은 자동으로 0벡터 초기화됨
+        if pad_id is not None:
+            self.embed_in = nn.Embedding(in_vocab, d_model, padding_idx=pad_id)
+        else:
+            self.embed_in = nn.Embedding(in_vocab, d_model)
+
+        # Dilated CNN 스택
         self.layers = nn.ModuleList(
             [
-                TransformerEncoderLayer(
+                DilatedConvBlock(
                     d_model=d_model,
-                    num_heads=num_heads,
-                    dim_feedforward=dim_feedforward,
+                    kernel_size=kernel_size,
+                    dilation=d,
                     dropout=dropout,
-                    max_rel_distance=max_rel_distance,
                 )
-                for _ in range(num_layers)
+                for d in dilations
             ]
         )
-        self.norm = nn.LayerNorm(d_model)
 
+        # 전역 표현 후 자릿수별로 position embedding 더해주기
         self.num_digit_classes = len(OUTPUT_CHARS)
-        self.classifier = nn.Linear(d_model, self.output_length * self.num_digit_classes)
+        self.pos_emb = nn.Embedding(self.output_length, d_model)
+        self.classifier = nn.Linear(d_model, self.num_digit_classes)
 
     def forward(self, src: torch.Tensor, src_pad_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        src: [B, T] (토큰 인덱스)
+        src_pad_mask: [B, T], pad 위치가 True인 bool 텐서
+        return: [B, output_length, num_digit_classes]
+        """
+        # [B, T] → [B, T, d_model]
         x = self.embed_in(src)
-        B = x.size(0)
-        cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1)
 
-        if src_pad_mask is not None:
-            cls_mask = torch.zeros((B, 1), dtype=torch.bool, device=src.device)
-            full_mask = torch.cat([cls_mask, src_pad_mask], dim=1)
-        else:
-            full_mask = None
-
+        # Dilated CNN 인코더 통과
         for layer in self.layers:
-            x = layer(x, src_key_padding_mask=full_mask)
+            x = layer(x)  # [B, T, d_model]
 
-        x = self.norm(x)
-        cls_repr = x[:, 0, :]
-        logits = self.classifier(cls_repr)
-        logits = logits.view(B, self.output_length, self.num_digit_classes)
+        # PAD 마스크를 고려한 masked mean pooling으로 전역 벡터 계산
+        if src_pad_mask is not None:
+            # non-pad 위치: True
+            nonpad = ~src_pad_mask  # [B, T]
+            # [B, T, 1]로 브로드캐스트 맞추기
+            nonpad_f = nonpad.unsqueeze(-1).float()
+            # PAD 위치는 0으로 날려버림
+            x_masked = x * nonpad_f
+            # 각 배치별 유효 길이
+            lengths = nonpad_f.sum(dim=1).clamp(min=1.0)  # [B, 1]
+            h_global = x_masked.sum(dim=1) / lengths      # [B, d_model]
+        else:
+            # 간단 mean pooling
+            h_global = x.mean(dim=1)  # [B, d_model]
+
+        B = src.size(0)
+
+        # 자리별 query: h_global + position embedding
+        positions = torch.arange(self.output_length, device=src.device)
+        positions = positions.unsqueeze(0).expand(B, -1)  # [B, output_length]
+        pos_vec = self.pos_emb(positions)                 # [B, output_length, d_model]
+
+        # [B, 1, d_model] + [B, output_length, d_model]
+        h = h_global.unsqueeze(1) + pos_vec               # [B, output_length, d_model]
+
+        # 각 자릿수마다 0~9 분류
+        logits = self.classifier(h)                       # [B, output_length, num_digit_classes]
         return logits
+
 
 
 # ========================
@@ -358,9 +354,10 @@ class Model(BaseModel):
         model_config_dict = dict(model_config_dict)
         model_config_dict.setdefault("output_length", self.max_output_length)
 
-        self.model = TinySeq2Seq(
+        self.model = TinyCNNSeq2Seq(
             in_vocab=self.input_tokenizer.vocab_size,
             out_vocab=self.output_tokenizer.vocab_size,
+            pad_id=self.input_tokenizer.pad_id,
             **model_config_dict,
         ).to(self.device)
 
