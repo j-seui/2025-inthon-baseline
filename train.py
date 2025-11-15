@@ -14,7 +14,7 @@ from dataloader import (
 from do_not_edit.metric import compute_metrics  # EM, TES 같은 간단한 성능 지표
 
 from model import (
-    TinySeq2Seq,
+    TinyCNNSeq2Seq,
     CharTokenizer,      # 문자 단위 토크나이저
     tokenize_batch,     # batch(dict)를 토크나이즈 + 패딩까지 해주는 함수
     digits_to_string,
@@ -261,7 +261,7 @@ def main():
     # --------------------------------------------------------------------------
     # 6) 모델 준비
     # --------------------------------------------------------------------------
-    # Transformer 기반의 TinySeq2Seq 모델을 준비합니다.
+    # CNN 기반의 TinySeq2Seq 모델을 준비합니다.
     model_config = ModelConfig(
         d_model=256,
         num_heads=8,
