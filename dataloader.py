@@ -1,10 +1,12 @@
 """베이스라인 데이터 생성 및 DataLoader"""
 from __future__ import annotations
-from typing import Dict, Any, Tuple, Union
+from typing import Dict, Any, Tuple, Union, List, Optional
+import math
 import random
 from functools import partial
 from torch.utils.data import DataLoader, Dataset
 
+from augmentation import generate_equivalents
 from do_not_edit.dataloader_validator import collate_fn_with_validation
 
 
@@ -47,8 +49,8 @@ def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]):
         return f"({expr})" if wrap else expr
 
     def _compose(op: str, left_meta, right_meta) -> str:
-        le, _, lo = left_meta
-        re, _, ro = right_meta
+        le, _, lo = left_meta[:3]
+        re, _, ro = right_meta[:3]
         le = _maybe_wrap(le, lo, op, True)
         re = _maybe_wrap(re, ro, op, False)
         expr = f"{le}{op}{re}"
@@ -58,7 +60,8 @@ def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]):
 
     def _build(d: int):
         if d == 0:
-            return _base_number()
+            expr, value, op = _base_number()
+            return expr, value, op, []
 
         left_depth = rng.randrange(d)
         right_depth = d - 1 - left_depth
@@ -87,10 +90,13 @@ def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]):
             value = lv // rv
 
         expression = _compose(op, left_meta, right_meta)
-        return expression, value, op
+        steps = left_meta[3] + right_meta[3]
+        step_desc = f"{lv} {op} {rv} = {value}"
+        steps.append(step_desc)
+        return expression, value, op, steps
 
-    expr_str, expr_val, _ = _build(depth)
-    return expr_str, expr_val
+    expr_str, expr_val, _, steps = _build(depth)
+    return expr_str, expr_val, steps
 
 
 class ArithmeticDataset(Dataset):
@@ -103,21 +109,98 @@ class ArithmeticDataset(Dataset):
         num_digits: Tuple[int, int] = (1, 3),
         seed: int = 42,
         mode: str = "train",
+        *,
+        equivalent_variants: int = 1,
+        curriculum_config: Optional[Dict[str, Any]] = None,
     ):
         self.num_samples = num_samples
         self.max_depth = max_depth
         self.num_digits = num_digits
         self.seed = seed
         self.mode = mode
+        self.num_equivalents = max(1, equivalent_variants)
+
+        cfg = curriculum_config or {}
+        enabled = bool(cfg) and bool(cfg.get("enabled", True))
+        self._curriculum_enabled = enabled
+        self._curriculum_num_stages = max(1, int(cfg.get("num_stages", 1))) if enabled else 1
+        initial_stage = int(cfg.get("initial_stage", 0))
+        self._curriculum_stage = min(max(initial_stage, 0), self._curriculum_num_stages - 1)
+        self._curriculum_keep_last = bool(cfg.get("keep_last_step", True))
+        self._curriculum_prefix = cfg.get("prefix", " =")
+        self._curriculum_wrapper = cfg.get("step_wrapper", "({step})")
     
     def __len__(self) -> int:
         return self.num_samples
     
+    @property
+    def curriculum_enabled(self) -> bool:
+        return self._curriculum_enabled
+
+    @property
+    def curriculum_stage_count(self) -> int:
+        return self._curriculum_num_stages
+
+    def set_curriculum_stage(self, stage: int) -> None:
+        if not self._curriculum_enabled:
+            return
+        stage = max(0, min(stage, self._curriculum_num_stages - 1))
+        self._curriculum_stage = stage
+
+    def _curriculum_steps_for_stage(self, steps: List[str]) -> List[str]:
+        if not (self._curriculum_enabled and steps):
+            return []
+        if self._curriculum_num_stages <= 1:
+            return steps
+        stage_idx = max(0, min(self._curriculum_stage, self._curriculum_num_stages - 1))
+        if stage_idx >= self._curriculum_num_stages - 1:
+            return []
+        ratio = stage_idx / (self._curriculum_num_stages - 1)
+        drop = int(math.ceil(ratio * len(steps)))
+        selected = steps[drop:]
+        if self._curriculum_keep_last and stage_idx < self._curriculum_num_stages - 1 and not selected:
+            selected = steps[-1:]
+        return selected
+
+    def _format_curriculum_suffix(self, stage_steps: List[str]) -> str:
+        if not stage_steps:
+            return ""
+        wrapped = " ".join(self._curriculum_wrapper.format(step=step) for step in stage_steps)
+        prefix = self._curriculum_prefix or " "
+        if prefix and not prefix.endswith(" "):
+            prefix = f"{prefix} "
+        return f"{prefix}{wrapped}".rstrip()
+    
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         rng = random.Random(self.seed + idx)
         depth = rng.randint(0, self.max_depth)
-        expr, val = _gen_expr(rng, depth, self.num_digits)
-        return {"input_text": expr, "target_text": str(val), "meta": {"depth": depth}}
+        expr, val, steps = _gen_expr(rng, depth, self.num_digits)
+        equivalents = generate_equivalents(expr, num_variants=self.num_equivalents, seed=self.seed + idx)
+
+        meta: Dict[str, Any] = {
+            "depth": depth,
+            "equivalent_text": equivalents,
+        }
+
+        if self._curriculum_enabled:
+            stage_steps = self._curriculum_steps_for_stage(steps)
+            suffix = self._format_curriculum_suffix(stage_steps)
+            stage_input = f"{expr}{suffix}"
+            meta["curriculum"] = {
+                "stage_index": self._curriculum_stage,
+                "num_stages": self._curriculum_num_stages,
+                "suffix": suffix,
+                "input_text": stage_input,
+                "steps_kept": stage_steps,
+                "steps_total": steps,
+            }
+
+        return {
+            "input_text": expr,
+            "equivalent_text": equivalents,
+            "target_text": str(val),
+            "meta": meta,
+        }
 
 
 def get_dataloader(

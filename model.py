@@ -21,7 +21,7 @@ EOS = "<eos>"
 # 규정에 맞는 입력/출력 문자 집합
 # INPUT_CHARS: 수식 입력에 사용 가능한 모든 문자 (숫자, 연산자, 괄호, 공백)
 # OUTPUT_CHARS: 모델이 출력할 수 있는 문자 (숫자만)
-INPUT_CHARS = list("0123456789+-*/() ")
+INPUT_CHARS = list("0123456789+-*/() =")
 OUTPUT_CHARS = list("0123456789")
 
 
