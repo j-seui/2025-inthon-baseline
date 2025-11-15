@@ -262,7 +262,7 @@ def main():
 
     # Validation Dataset, 자세한 설정은 dataloader.py를 참고하세요.
     val_dataset = ArithmeticDataset(
-        num_samples=128,
+        num_samples=10_000,
         max_depth=4,
         num_digits=(1, 5),
         seed=999,
