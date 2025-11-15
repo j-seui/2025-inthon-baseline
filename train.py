@@ -43,6 +43,9 @@ def train_loop(
 
     # 옵티마이저: AdamW는 Adam + weight decay가 들어간 버전
     optim = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optim, T_max=train_config.max_train_steps if train_config.max_train_steps is not None else 1000
+    )
 
     # 각 자리수에 대한 CrossEntropy loss
     loss_fn = nn.CrossEntropyLoss()
@@ -162,15 +165,44 @@ def train_loop(
             src_pad_mask = src.eq(input_tokenizer.pad_id)
 
             # Forward: Transformer Encoder 결과로 자리별 logits 생성
-            logits = model(src, src_pad_mask)
+            logits = model(src, src_pad_mask)  # [B, L, 10]
+            B, L, V = logits.shape
+            targets = target_digits  # [B, L]
+
+            # (1) mask 계산: leading zero는 무시
+            with torch.no_grad():
+                # CPU numpy로 편하게 처리해도 되고, torch로만 해도 됨
+                t = targets.cpu().numpy()
+                mask = np.zeros_like(t, dtype=bool)
+                for b in range(B):
+                    seq = t[b]
+                    nonzero = np.where(seq != 0)[0]
+                    if len(nonzero) == 0:
+                        # 값이 0이면 마지막 자리만 학습
+                        mask[b, -1] = True
+                    else:
+                        first = nonzero[0]
+                        mask[b, first:] = True
+
+                mask = torch.from_numpy(mask).to(targets.device)  # [B, L]
+
+            logits_flat  = logits.view(-1, V)
+            targets_flat = targets.view(-1)
+            mask_flat    = mask.view(-1)
+
+            loss = loss_fn(
+                logits_flat[mask_flat],
+                targets_flat[mask_flat],
+            )
+
 
             # --------------------------------------------------------------
             # 4) Loss 계산
             # --------------------------------------------------------------
-            loss = loss_fn(
-                logits.view(-1, logits.size(-1)),  # (B*T, V)
-                target_digits.view(-1),             # (B*T,)
-            )
+            # loss = loss_fn(
+            #     logits.view(-1, logits.size(-1)),  # (B*T, V)
+            #     target_digits.view(-1),             # (B*T,)
+            # )
             train_loss = loss.item()
             latest_train_loss = train_loss
 
@@ -193,6 +225,8 @@ def train_loop(
         if val_dataloader is not None:
             run_validation(epoch + 1)
 
+        scheduler.step()
+
         if max_steps_reached:
             break
 
@@ -210,7 +244,7 @@ def main():
     # Train Dataset, 자세한 설정은 dataloader.py를 참고하세요.
     train_dataset = ArithmeticDataset(
         num_samples=500_000,
-        max_depth=3,
+        max_depth=4,
         num_digits=(1, 3),
         seed=123,
         mode="train",
@@ -272,7 +306,7 @@ def main():
     # 학습 하이퍼파라미터 설정
     train_config = TrainConfig(
         max_train_steps=None,
-        lr=2e-3,
+        lr=1e-3,
         valid_every=200,
         max_gen_len=24,
         show_valid_samples=5,
