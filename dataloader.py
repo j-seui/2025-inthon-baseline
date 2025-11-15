@@ -19,7 +19,8 @@ def _rand_int(rng: random.Random, num_digits: Tuple[int, int]) -> int:
     return int(str(first) + "".join(str(x) for x in rest))
 
 
-def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]) -> Tuple[str, int]:
+def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int],
+              number_factor: float = 0.5, term_factor: float = 0.5) -> Tuple[str, int]:
     """재귀적 수식 생성 (연산자 우선순위 반영)"""
     
     def number() -> Tuple[str, int]:
@@ -27,13 +28,13 @@ def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]) -> Tu
         return str(v), v
     
     def factor(d: int) -> Tuple[str, int]:
-        if d == 0 or rng.random() < 0.7:
+        if d == 0 or rng.random() < number_factor:
             return number()
         e, v = expr(d - 1)
         return f"({e})", v
     
     def term(d: int) -> Tuple[str, int]:
-        if d == 0 or rng.random() < 0.5:
+        if d == 0 or rng.random() < term_factor:
             return factor(d)
         
         op = rng.choice(["*", "//"])
@@ -48,7 +49,7 @@ def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]) -> Tu
         return f"{le}{op}{re}", v
     
     def expr(d: int) -> Tuple[str, int]:
-        if d == 0 or rng.random() < 0.5:
+        if d == 0 or rng.random() < term_factor:
             return term(d)
         
         op = rng.choice(["+", "-"])
