@@ -1,3 +1,4 @@
+from __future__ import annotations
 import importlib, config, dataloader, model
 
 importlib.reload(config)
@@ -7,7 +8,6 @@ importlib.reload(model)
 ########################
 
 
-from __future__ import annotations
 from typing import List, Any, Tuple, Dict
 from config import TrainConfig, ModelConfig, TokenizerConfig
 import random
