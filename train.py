@@ -332,7 +332,12 @@ def train_loop(
 
                     ref_indices = torch.tensor([idx for idx, _, _ in law_pairs], dtype=torch.long, device=device)
                     ref_logits = logits.index_select(0, ref_indices)
-                    law_loss = F.mse_loss(ref_logits, aug_logits)
+                    
+                    # Shape 맞추기: ref_logits와 aug_logits의 sequence length가 다를 수 있음
+                    min_len = min(ref_logits.size(1), aug_logits.size(1))
+                    ref_logits_trimmed = ref_logits[:, :min_len, :]
+                    aug_logits_trimmed = aug_logits[:, :min_len, :]
+                    law_loss = F.mse_loss(ref_logits_trimmed, aug_logits_trimmed)
 
             total_loss = ce_loss + law_lambda * law_loss
 

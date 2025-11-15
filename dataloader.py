@@ -153,12 +153,19 @@ class ArithmeticDataset(Dataset):
         if self._curriculum_num_stages <= 1:
             return steps
         stage_idx = max(0, min(self._curriculum_stage, self._curriculum_num_stages - 1))
-        if stage_idx >= self._curriculum_num_stages - 1:
-            return []
+        
+        # Stage 0: 모든 step, Stage N-1: step 없음 (implicit CoT)
+        # ratio: 0.0 (stage 0) -> 1.0 (stage N-1)
         ratio = stage_idx / (self._curriculum_num_stages - 1)
-        drop = int(math.ceil(ratio * len(steps)))
-        selected = steps[drop:]
-        if self._curriculum_keep_last and stage_idx < self._curriculum_num_stages - 1 and not selected:
+        num_to_remove = int(ratio * len(steps))
+        num_to_keep = len(steps) - num_to_remove
+        
+        if num_to_keep <= 0:
+            # 마지막 stage: suffix 없음 (implicit CoT)
+            return []
+        
+        selected = steps[:num_to_keep]
+        if self._curriculum_keep_last and not selected and stage_idx < self._curriculum_num_stages - 1:
             selected = steps[-1:]
         return selected
 
