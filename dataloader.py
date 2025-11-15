@@ -19,6 +19,18 @@ def _rand_int(rng: random.Random, num_digits: Tuple[int, int]) -> int:
     return int(str(first) + "".join(str(x) for x in rest))
 
 
+def _needs_wrap(expr: str) -> bool:
+    """Check if the expression needs parentheses to preserve operation order."""
+    if expr.isdigit():
+        return False
+    return not (expr.startswith("(") and expr.endswith(")"))
+
+
+def _maybe_wrap(expr: str) -> str:
+    """Wrap expression in parentheses if needed."""
+    return f"({expr})" if _needs_wrap(expr) else expr
+
+
 def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]):
     """exact depth의 arithmetic expression 생성"""
     
@@ -63,10 +75,13 @@ def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]):
                 le, re = re, le
             v = lv - rv
 
+        le_fmt = _maybe_wrap(le)
+        re_fmt = _maybe_wrap(re)
+        expr_core = f"{le_fmt}{op}{re_fmt}"
         if rng.random() < 0.5:
-            return f"({le}{op}{re})", v
+            return f"({expr_core})", v
         else:
-            return f"{le}{op}{re}", v
+            return expr_core, v
 
     return expr(depth)
 
