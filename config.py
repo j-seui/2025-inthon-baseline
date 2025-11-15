@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 
 @dataclass
@@ -36,7 +36,3 @@ class TrainConfig:
     law_num_variants: int = 1
     law_max_pairs_per_batch: int = 32
     law_seed: int = 0
-    curriculum_enabled: bool = False
-    curriculum_num_stages: int = 1
-    curriculum_stage_steps: Optional[Tuple[int, ...]] = None
-    curriculum_stage_epochs: Optional[Tuple[int, ...]] = None

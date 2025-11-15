@@ -17,7 +17,7 @@ PAD = "<pad>"
 BOS = "<bos>"
 EOS = "<eos>"
 
-INPUT_CHARS = list("0123456789+-*/() =")
+INPUT_CHARS = list("0123456789+-*/() ")
 OUTPUT_CHARS = list("0123456789")
 
 
@@ -515,10 +515,7 @@ class Model(BaseModel):
         model_state = checkpoint.get("model_state", checkpoint)
         self.model.load_state_dict(model_state)
 
-        train_config_dict = checkpoint.get("train_config") or {}
-        self.max_len = int(train_config_dict.get("max_gen_len", 50))
-        if self.max_len <= 0:
-            self.max_len = 50
+        self.max_len = 50
         self.model.eval()
 
     def predict(self, input_text: str) -> str:
@@ -554,3 +551,4 @@ class Model(BaseModel):
 
         pred = preds[0] if preds else ""
         return pred if pred.isdigit() else ""
+
