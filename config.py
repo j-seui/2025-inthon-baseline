@@ -35,3 +35,7 @@ class TrainConfig:
     show_valid_samples: int = 5
     num_epochs: int = 4
     save_best_path: Optional[str] = None
+    law_lambda: float = 0.0
+    law_num_variants: int = 1
+    law_max_pairs_per_batch: int = 32
+    law_seed: int = 0
