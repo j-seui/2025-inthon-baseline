@@ -21,48 +21,72 @@ def _rand_int(rng: random.Random, num_digits: Tuple[int, int]) -> int:
 
 def _gen_expr(rng: random.Random, depth: int, num_digits: Tuple[int, int]):
     """exact depth의 arithmetic expression 생성"""
-    
-    def number():
-        v = _rand_int(rng, num_digits)
-        return str(v), v
+    precedence = {"+": 1, "-": 1, "*": 2, "//": 2}
+    operators = ("+", "-", "*", "//")
 
-    def random_split(total):
-        if total <= 0:
-            return 0, 0
-        left = rng.randint(0, total - 1)
-        right = total - 1 - left
-        return left, right
+    def _base_number():
+        value = _rand_int(rng, num_digits)
+        return str(value), value, None
 
-    def expr(d):
-        if d == 0:
-            return number()
-
-        op = rng.choice(["+", "-", "*", "//"])
-        left, right = random_split(d)
-        le, lv = expr(left)
-        re, rv = expr(right)
-
-        # 음수 방지
-        if op == "-" and lv < rv:
-            lv, rv = rv, lv
-            le, re = re, le
-
-        # 0으로 나누기 방지
-        if op == "//" and rv == 0:
-            # 1차 재시도
-            re2, rv2 = expr(right)
-            if rv2 != 0:
-                re, rv = re2, rv2
+    def _maybe_wrap(expr: str, child_op: Union[str, None], parent_op: str, is_left: bool) -> str:
+        if child_op is None:
+            wrap = rng.random() < 0.05
+        else:
+            child_prec = precedence[child_op]
+            parent_prec = precedence[parent_op]
+            if is_left:
+                wrap = child_prec < parent_prec
             else:
-                # fallback
-                rv = _rand_int(rng, num_digits)
-                rv = rv if rv != 0 else 1
-                re = str(rv)
+                wrap = child_prec <= parent_prec
+            if not wrap:
+                wrap = rng.random() < 0.15
+        return f"({expr})" if wrap else expr
 
-        expression = f"{le}{op}{re}" if rng.random() < 0.5 else f"({le}{op}{re})"
-        return expression, eval(expression)
+    def _compose(op: str, left_meta, right_meta) -> str:
+        le, _, lo = left_meta
+        re, _, ro = right_meta
+        le = _maybe_wrap(le, lo, op, True)
+        re = _maybe_wrap(re, ro, op, False)
+        expr = f"{le}{op}{re}"
+        if rng.random() < 0.2:
+            expr = f"({expr})"
+        return expr
 
-    return expr(depth)
+    def _build(d: int):
+        if d == 0:
+            return _base_number()
+
+        left_depth = rng.randrange(d)
+        right_depth = d - 1 - left_depth
+        left_meta = _build(left_depth)
+        right_meta = _build(right_depth)
+
+        op = rng.choice(operators)
+
+        if op == "-":
+            if left_meta[1] < right_meta[1]:
+                left_meta, right_meta = right_meta, left_meta
+        elif op == "//":
+            while right_meta[1] == 0:
+                right_meta = _build(right_depth)
+
+        lv = left_meta[1]
+        rv = right_meta[1]
+
+        if op == "+":
+            value = lv + rv
+        elif op == "-":
+            value = lv - rv
+        elif op == "*":
+            value = lv * rv
+        else:
+            value = lv // rv
+
+        expression = _compose(op, left_meta, right_meta)
+        return expression, value, op
+
+    expr_str, expr_val, _ = _build(depth)
+    return expr_str, expr_val
 
 
 class ArithmeticDataset(Dataset):
