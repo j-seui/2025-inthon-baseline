@@ -36,3 +36,8 @@ class TrainConfig:
     law_num_variants: int = 1
     law_max_pairs_per_batch: int = 32
     law_seed: int = 0
+    # Expression consistency 강화 전략
+    consistency_lambda: float = 0.1  # consistency loss 가중치
+    use_hard_negatives: bool = True  # hard negative 사용 여부
+    hard_neg_lambda: float = 0.05    # hard negative loss 가중치
+    canonicalize_input: bool = False # 입력 표현식 정규화 여부

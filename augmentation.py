@@ -302,6 +302,38 @@ def equivalent(a: str, b: str) -> bool:
         return False
 
 
+# ===== canonicalize_expression =====
+
+def canonicalize_expression(expr_str: str) -> str:
+    """
+    표현식을 정규화된(canonical) 형태로 변환.
+    교환법칙과 결합법칙을 적용하여 일관된 형태로 만듦.
+    예: "3+2" -> "2+3", "2*3+5" -> "5+2*3" (숫자 크기 기준 정렬)
+    """
+    try:
+        ast = parse_expression(expr_str)
+        
+        def canonicalize_node(node: Node) -> Node:
+            if node.kind == "num":
+                return node
+            
+            # 자식 먼저 정규화
+            children = [canonicalize_node(c) for c in node.children]
+            
+            # 교환법칙이 성립하는 연산자에 대해 정렬
+            if node.op in ("+", "*") and len(children) >= 2:
+                # 노드를 문자열로 변환하여 사전순 정렬
+                children.sort(key=lambda n: strict_to_string(n))
+            
+            return Node("op", op=node.op, children=children)
+        
+        canonical_ast = canonicalize_node(ast)
+        return minimal_to_string(canonical_ast)
+    except Exception:
+        # 파싱 실패 시 원본 반환
+        return expr_str
+
+
 # ===== generate_equivalents =====
 
 def generate_equivalents(expr_str: str, num_variants: int = 5, seed: Optional[int] = None):

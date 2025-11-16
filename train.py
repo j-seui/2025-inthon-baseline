@@ -195,6 +195,9 @@ def train_loop(
             )
 
             law_loss = torch.tensor(0.0, device=device)
+            consistency_loss = torch.tensor(0.0, device=device)
+            hard_neg_loss = torch.tensor(0.0, device=device)
+            
             if law_lambda > 0:
                 law_pairs = _sample_law_pairs(batch)
                 if law_pairs:
@@ -225,8 +228,50 @@ def train_loop(
                     ref_indices = torch.tensor([idx for idx, _, _ in law_pairs], dtype=torch.long, device=device)
                     ref_logits = logits.index_select(0, ref_indices)
                     law_loss = F.mse_loss(ref_logits, aug_logits)
+                    
+                    # Consistency Loss: 같은 값의 표현식은 같은 출력 분포를 가져야 함
+                    consistency_lambda = getattr(train_config, "consistency_lambda", 0.0)
+                    if consistency_lambda > 0:
+                        # Softmax 분포 레벨에서 KL divergence 사용
+                        ref_probs = F.softmax(ref_logits, dim=-1)
+                        aug_probs = F.softmax(aug_logits, dim=-1)
+                        consistency_loss = F.kl_div(
+                            F.log_softmax(aug_logits, dim=-1),
+                            ref_probs,
+                            reduction='batchmean'
+                        )
+            
+            # Hard Negative Mining: 비슷하지만 다른 값의 표현식 구별 학습
+            use_hard_negatives = getattr(train_config, "use_hard_negatives", False)
+            hard_neg_lambda = getattr(train_config, "hard_neg_lambda", 0.0)
+            if use_hard_negatives and hard_neg_lambda > 0:
+                # 배치 내에서 입력은 비슷하지만 출력이 다른 쌍을 찾아 마진 기반 손실 적용
+                inputs = batch.get("input_text", [])
+                targets = batch.get("target_text", [])
+                if len(inputs) > 1:
+                    # 간단한 전략: 같은 연산자를 포함하지만 다른 값인 쌍 찾기
+                    hard_pairs = []
+                    for i in range(len(inputs)):
+                        for j in range(i+1, min(i+5, len(inputs))):
+                            if targets[i] != targets[j]:
+                                # 입력 길이나 연산자가 비슷한 경우
+                                if abs(len(inputs[i]) - len(inputs[j])) <= 2:
+                                    hard_pairs.append((i, j))
+                    
+                    if hard_pairs:
+                        # 선택된 쌍들의 logits를 비교하여 다르게 만들도록 학습
+                        pair_losses = []
+                        for i, j in hard_pairs[:16]:  # 최대 16쌍만
+                            logit_i = logits[i].mean(dim=0)  # (V,)
+                            logit_j = logits[j].mean(dim=0)  # (V,)
+                            # 다른 값이므로 출력 분포가 달라야 함 (음의 코사인 유사도)
+                            sim = F.cosine_similarity(logit_i.unsqueeze(0), logit_j.unsqueeze(0))
+                            # margin을 두고 거리를 벌림
+                            pair_losses.append(F.relu(sim + 0.2))  # margin=0.2
+                        if pair_losses:
+                            hard_neg_loss = torch.stack(pair_losses).mean()
 
-            total_loss = ce_loss + law_lambda * law_loss
+            total_loss = ce_loss + law_lambda * law_loss + consistency_lambda * consistency_loss + hard_neg_lambda * hard_neg_loss
 
             # --------------------------------------------------------------
             # 5) Backward + optimizer step
@@ -342,6 +387,7 @@ def main():
         num_digits=(1, 5),
         seed=123,
         mode="train",
+        depth_weights={0: 0.15, 1: 0.15, 2: 0.3, 3: 0.25, 4: 0.15}  # depth 분포 조정
     )
     train_mul_only = ArithmeticDataset(
         num_samples=100_000,
@@ -430,6 +476,11 @@ def main():
         law_num_variants=2,
         law_max_pairs_per_batch=32,
         law_seed=42,
+        # Expression consistency 강화
+        consistency_lambda=0.1,   # consistency loss 활성화
+        use_hard_negatives=True,  # hard negative mining 활성화
+        hard_neg_lambda=0.05,     # hard negative loss 가중치
+        canonicalize_input=False, # 정규화는 선택적으로
     )
 
     # --------------------------------------------------------------------------
