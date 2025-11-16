@@ -382,7 +382,7 @@ def main():
 
     # Train Dataset, 자세한 설정은 dataloader.py를 참고하세요.
     train_dataset = ArithmeticDataset(
-        num_samples=1_000_000,
+        num_samples=500_000,
         max_depth=4,
         num_digits=(1, 5),
         seed=123,
@@ -390,7 +390,7 @@ def main():
         depth_weights={0: 0.15, 1: 0.15, 2: 0.3, 3: 0.25, 4: 0.15}  # depth 분포 조정
     )
     train_mul_only = ArithmeticDataset(
-        num_samples=100_000,
+        num_samples=50_000,
         max_depth=2,
         num_digits=(3, 5),
         seed=123,
@@ -472,7 +472,7 @@ def main():
         show_valid_samples=5,
         num_epochs=10,     # 처음엔 10 epoch 정도로
         save_best_path="best_model.pt",
-        law_lambda=0.15,
+        law_lambda=0.1,
         law_num_variants=2,
         law_max_pairs_per_batch=32,
         law_seed=42,
